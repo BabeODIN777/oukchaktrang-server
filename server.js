@@ -1,197 +1,102 @@
-require('dotenv').config();
+// server.js for Railway
 const express = require('express');
-const mysql = require('mysql2/promise');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
+app.use(cors());
+app.use(express.json());
 
-// CRITICAL: Railway needs proper CORS for health checks
-app.use(cors({
-  origin: '*', // Allow all origins for now
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+// Connect to MongoDB (Railway provides MONGODB_URI)
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/oukchaktrang';
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('MongoDB connection error:', err));
 
-// Parse JSON with limit
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-// SIMPLE HEALTH CHECK - Railway looks for this
-app.get('/', (req, res) => {
-  console.log('Health check received');
-  res.status(200).json({ 
-    status: 'online',
-    service: 'Ouk Chaktrang Game Server',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
-  });
+// User Schema
+const userSchema = new mongoose.Schema({
+  userId: { type: String, unique: true },
+  username: { type: String, unique: true, required: true },
+  email: { type: String, unique: true, required: true },
+  passwordHash: { type: String, required: true },
+  displayName: { type: String },
+  avatarUrl: { type: String, default: 'default_avatar' },
+  country: { type: String, default: 'Cambodia' },
+  coins: { type: Number, default: 1000 },
+  diamonds: { type: Number, default: 10 },
+  totalWins: { type: Number, default: 0 },
+  totalLosses: { type: Number, default: 0 },
+  totalDraws: { type: Number, default: 0 },
+  currentLevel: { type: Number, default: 1 },
+  highestLevel: { type: Number, default: 1 },
+  experiencePoints: { type: Number, default: 0 },
+  guildName: { type: String, default: '' },
+  isDeveloper: { type: Boolean, default: false },
+  isPremium: { type: Boolean, default: false },
+  achievements: { type: Array, default: [] },
+  stats: {
+    rating: { type: Number, default: 1200 },
+    streak: { type: Number, default: 0 },
+    gamesPlayed: { type: Number, default: 0 },
+    winRate: { type: Number, default: 0 }
+  },
+  createdDate: { type: Date, default: Date.now },
+  lastLogin: { type: Date, default: Date.now }
 });
 
-// Add a dedicated health endpoint
-app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'healthy',
-    timestamp: new Date().toISOString()
-  });
+const User = mongoose.model('User', userSchema);
+
+// JWT Secret (set in Railway environment variables)
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+
+// Helper function to hash password
+const hashPassword = (password) => {
+  const salt = bcrypt.genSaltSync(10);
+  return bcrypt.hashSync(password, salt);
+};
+
+// Routes
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-// Database connection with fallback
-let dbPool = null;
-let isDatabaseConnected = false;
-
-async function initializeDatabase() {
+// Login
+app.post('/api/auth/login', async (req, res) => {
   try {
-    console.log('Initializing database connection...');
+    const { email, password } = req.body;
     
-    // Check what database Railway provides
-    console.log('Environment variables:', {
-      DATABASE_URL: process.env.DATABASE_URL ? 'Set' : 'Not set',
-      MYSQLHOST: process.env.MYSQLHOST || 'Not set',
-      RAILWAY_ENVIRONMENT: process.env.RAILWAY_ENVIRONMENT || 'Not set'
-    });
-    
-    // For Railway, always use DATABASE_URL if available
-    if (process.env.DATABASE_URL) {
-      console.log('Using PostgreSQL with DATABASE_URL');
-      
-      // Parse DATABASE_URL for PostgreSQL
-      const { Pool } = require('pg');
-      dbPool = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-      });
-      
-      // Test connection
-      const client = await dbPool.connect();
-      console.log('PostgreSQL connected successfully');
-      client.release();
-      
-    } else if (process.env.MYSQLHOST) {
-      console.log('Using MySQL with individual variables');
-      dbPool = mysql.createPool({
-        host: process.env.MYSQLHOST || 'localhost',
-        user: process.env.MYSQLUSER || 'root',
-        password: process.env.MYSQLPASSWORD || '',
-        database: process.env.MYSQLDATABASE || 'railway',
-        port: process.env.MYSQLPORT || 3306,
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0
-      });
-      
-      // Test connection
-      await dbPool.getConnection();
-      console.log('MySQL connected successfully');
-      
-    } else {
-      console.log('No database configuration found, running in memory-only mode');
-      isDatabaseConnected = false;
-      return;
+    // Find user by email
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
     
-    isDatabaseConnected = true;
-    
-    // Create tables if they don't exist
-    await createTables();
-    
-  } catch (error) {
-    console.error('Database initialization failed:', error.message);
-    console.log('Running without database (in-memory mode)');
-    isDatabaseConnected = false;
-  }
-}
-
-async function createTables() {
-  if (!isDatabaseConnected) return;
-  
-  try {
-    // Create users table
-    if (process.env.DATABASE_URL) {
-      // PostgreSQL
-      await dbPool.query(`
-        CREATE TABLE IF NOT EXISTS users (
-          id SERIAL PRIMARY KEY,
-          username VARCHAR(50) UNIQUE NOT NULL,
-          email VARCHAR(100) UNIQUE NOT NULL,
-          password_hash VARCHAR(255) NOT NULL,
-          display_name VARCHAR(50),
-          coins INTEGER DEFAULT 1000,
-          diamonds INTEGER DEFAULT 10,
-          level INTEGER DEFAULT 1,
-          total_wins INTEGER DEFAULT 0,
-          total_losses INTEGER DEFAULT 0,
-          total_draws INTEGER DEFAULT 0,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          last_login TIMESTAMP
-        );
-      `);
-    } else {
-      // MySQL
-      await dbPool.query(`
-        CREATE TABLE IF NOT EXISTS users (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          username VARCHAR(50) UNIQUE NOT NULL,
-          email VARCHAR(100) UNIQUE NOT NULL,
-          password_hash VARCHAR(255) NOT NULL,
-          display_name VARCHAR(50),
-          coins INT DEFAULT 1000,
-          diamonds INT DEFAULT 10,
-          level INT DEFAULT 1,
-          total_wins INT DEFAULT 0,
-          total_losses INT DEFAULT 0,
-          total_draws INT DEFAULT 0,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          last_login TIMESTAMP
-        );
-      `);
+    // Verify password
+    const validPassword = bcrypt.compareSync(password, user.passwordHash);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
     
-    console.log('Database tables created/verified');
+    // Update last login
+    user.lastLogin = new Date();
+    await user.save();
     
-  } catch (error) {
-    console.error('Table creation error:', error.message);
-  }
-}
-
-// API Routes
-app.post('/api/register', async (req, res) => {
-  try {
-    // If database not connected, return error
-    if (!isDatabaseConnected) {
-      return res.status(503).json({ 
-        error: 'Database temporarily unavailable',
-        mode: 'offline'
-      });
-    }
+    // Create JWT token
+    const token = jwt.sign(
+      { userId: user.userId, email: user.email },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
     
-    const { username, email, password } = req.body;
+    // Return user data (excluding password)
+    const userResponse = user.toObject();
+    delete userResponse.passwordHash;
     
-    if (!username || !email || !password) {
-      return res.status(400).json({ error: 'All fields required' });
-    }
-    
-    // ... rest of registration code from previous version ...
-    // For now, return success without database
-    res.json({
-      success: true,
-      message: 'Registration endpoint working',
-      database: isDatabaseConnected ? 'connected' : 'offline'
-    });
-    
-  } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/login', async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      message: 'Login endpoint working',
-      database: isDatabaseConnected ? 'connected' : 'offline'
+    res.json({ 
+      token, 
+      user: userResponse 
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -199,53 +104,146 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// CRITICAL: Handle all unhandled routes
-app.use('*', (req, res) => {
-  res.status(404).json({ 
-    error: 'Endpoint not found',
-    path: req.originalUrl,
-    method: req.method 
-  });
+// Register
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, email, password, displayName } = req.body;
+    
+    // Check if user exists
+    const existingUser = await User.findOne({ 
+      $or: [{ email }, { username }] 
+    });
+    
+    if (existingUser) {
+      return res.status(400).json({ 
+        error: existingUser.email === email ? 
+          'Email already registered' : 
+          'Username already taken' 
+      });
+    }
+    
+    // Create new user
+    const newUser = new User({
+      userId: require('crypto').randomUUID(),
+      username,
+      email,
+      passwordHash: hashPassword(password),
+      displayName: displayName || username,
+      createdDate: new Date(),
+      lastLogin: new Date()
+    });
+    
+    await newUser.save();
+    
+    // Create JWT token
+    const token = jwt.sign(
+      { userId: newUser.userId, email: newUser.email },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    
+    // Return user data (excluding password)
+    const userResponse = newUser.toObject();
+    delete userResponse.passwordHash;
+    
+    res.status(201).json({ 
+      token, 
+      user: userResponse 
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({ 
-    error: 'Internal server error',
-    message: err.message 
-  });
+// Get user profile
+app.get('/api/user/profile/:userId', async (req, res) => {
+  try {
+    const user = await User.findOne({ userId: req.params.userId });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userResponse = user.toObject();
+    delete userResponse.passwordHash;
+    
+    res.json(userResponse);
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-// Start server
-const PORT = process.env.PORT || 3000;
+// Update user profile
+app.put('/api/user/update/:userId', async (req, res) => {
+  try {
+    const updates = req.body;
+    const user = await User.findOneAndUpdate(
+      { userId: req.params.userId },
+      { $set: updates },
+      { new: true }
+    );
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userResponse = user.toObject();
+    delete userResponse.passwordHash;
+    
+    res.json(userResponse);
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
-async function startServer() {
-  // Initialize database (but don't block server start)
-  initializeDatabase().then(() => {
-    console.log('Database initialization attempt completed');
-  }).catch(console.error);
+// Update user stats
+app.post('/api/user/stats', async (req, res) => {
+  try {
+    const { userId, ...stats } = req.body;
+    
+    const user = await User.findOne({ userId });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Update stats
+    Object.keys(stats).forEach(key => {
+      if (key in user) {
+        user[key] = stats[key];
+      }
+    });
+    
+    await user.save();
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Middleware to verify JWT
+const verifyToken = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
   
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📡 Health check: http://0.0.0.0:${PORT}/`);
-    console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`🗄️ Database: ${isDatabaseConnected ? 'Connected' : 'Not connected'}`);
-  });
-}
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+};
 
-// Handle graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  process.exit(0);
+// Protected route example
+app.get('/api/user/protected', verifyToken, (req, res) => {
+  res.json({ message: 'Protected data', user: req.user });
 });
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down');
-  process.exit(0);
-});
-
-startServer().catch(error => {
-  console.error('Failed to start server:', error);
-  process.exit(1);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
